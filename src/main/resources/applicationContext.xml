@@ -16,9 +16,6 @@
 			expression="org.springframework.web.bind.annotation.ControllerAdvice" />
 	</context:component-scan>
 
-	<import resource="applicationContext-db.xml" />
-	<import resource="applicationContext-jms.xml" />
-
 	<context:property-placeholder
 		ignore-resource-not-found="true"
 		location="classpath*:db.properties,classpath*:application.properties" />
