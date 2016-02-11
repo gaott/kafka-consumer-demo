@@ -24,76 +24,82 @@ import com.util.Log;
  */
 public class Processor implements Runnable {
 
-  private final String topic;
+	private final String topic;
 
-  private final List<String> beanids;
+	private final List<String> beanids;
 
-  private final ConsumerConnector connector;
+	private final ConsumerConnector connector;
 
-  private final ThreadPoolExecutor pool;
-  
-  private final DB leveldb;
+	private final ThreadPoolExecutor pool;
 
-  public Processor(String topic, ConsumerConnector connector, int maxWorkerCount, List<String> beanids, DB leveldb) {
-    this.topic = topic;
-    this.connector = connector;
-    this.pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(maxWorkerCount);
-    this.beanids = beanids;
-    this.leveldb = leveldb;
-  }
+	private final DB leveldb;
 
-  private boolean isWorking = true;
+	public Processor(String topic, ConsumerConnector connector, int maxWorkerCount, List<String> beanids, DB leveldb) {
+		this.topic = topic;
+		this.connector = connector;
+		this.pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(maxWorkerCount);
+		this.beanids = beanids;
+		this.leveldb = leveldb;
+	}
 
-  public boolean getWorkingStatus() {
-    return isWorking;
-  }
+	private boolean isWorking = true;
 
-  public void setProcessorWorking(boolean isWorking) {
-    this.isWorking = isWorking;
-  }
+	public boolean getWorkingStatus() {
+		return isWorking;
+	}
 
-  public Map<String, Object> getStatus() {
-    Map<String, Object> status = new HashMap<String, Object>();
-    status.put("pool_size", pool.getPoolSize());
-    status.put("active_count", pool.getActiveCount());
-    status.put("queue_size", pool.getQueue().size());
+	public void setProcessorWorking(boolean isWorking) {
+		this.isWorking = isWorking;
+	}
 
-    return status;
-  }
+	public Map<String, Object> getStatus() {
+		Map<String, Object> status = new HashMap<String, Object>();
+		status.put("pool_size", pool.getPoolSize());
+		status.put("active_count", pool.getActiveCount());
+		status.put("queue_size", pool.getQueue().size());
 
-  @Override
-  public void run() {
+		return status;
+	}
 
-    if (!isWorking) {
-      return;
-    }
+	@Override
+	public void run() {
 
-    Map<String, Integer> topicCountMap = new HashMap<String, Integer>();
-    topicCountMap.put(topic, 1);
-    Map<String, List<KafkaStream<byte[], byte[]>>> kafkaStreamMap = connector.createMessageStreams(topicCountMap);
-    KafkaStream<byte[], byte[]> stream = kafkaStreamMap.get(topic).get(0);
-    
-    // 接收消息，分配相应的 worker 处理
-    for (MessageAndMetadata<byte[], byte[]> messageAndMetadata : stream) {
-      
-      if (!isWorking) {
-        Log.i("********* stop consumer ***********");
-        break;
-      }
+		if (!isWorking) {
+			return;
+		}
 
-      distributeMessage(new String(messageAndMetadata.message()));
-    }
-  }
+		Map<String, Integer> topicCountMap = new HashMap<String, Integer>();
+		topicCountMap.put(topic, 1);
+		Map<String, List<KafkaStream<byte[], byte[]>>> kafkaStreamMap = connector
+				.createMessageStreams(topicCountMap);
+		KafkaStream<byte[], byte[]> stream = kafkaStreamMap.get(topic).get(0);
 
-  public void distributeMessage(String message) {
-    for (String beanid : beanids) {
-      BaseWorker worker  = (BaseWorker)StartUp.getContext().getBean(beanid);
-      worker.message = message;
-      worker.topic = topic;
-      worker.leveldb = leveldb;
-      
-      pool.submit(worker);
-    }
-  }
+		// 接收消息，分配相应的 worker 处理
+		for (MessageAndMetadata<byte[], byte[]> messageAndMetadata : stream) {
+
+			if (!isWorking) {
+				Log.i("********* stop consumer ***********");
+				break;
+			}
+
+			distributeMessage(new String(messageAndMetadata.message()));
+		}
+	}
+
+	/**
+	 * 分解 message 信息，调用对应的 Worker 进行处理
+	 * 
+	 * @param message
+	 */
+	public void distributeMessage(String message) {
+		for (String beanid : beanids) {
+			BaseWorker worker = (BaseWorker) StartUp.getContext().getBean(beanid);
+			worker.message = message;
+			worker.topic = topic;
+			worker.leveldb = leveldb;
+
+			pool.submit(worker);
+		}
+	}
 
 }

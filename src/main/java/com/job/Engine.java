@@ -42,137 +42,152 @@ import com.util.Log;
 @Component
 public class Engine {
 
-  private ConsumerConnector connector;
+	/**
+	 * 1. 初始化线程池 2. 建立与 kafka 服务之间的链接 3. 创建 levelDB 存储空间
+	 * 
+	 * @throws IOException
+	 */
+	@PostConstruct
+	public void init() throws IOException {
+		this.pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(100);
+		this.scheduledPool = (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(1);
+		this.processorMap = new HashMap<>();
 
-  private ThreadPoolExecutor pool;
+		Properties props = new Properties();
+		props.put("zookeeper.connect", zkConnectHost);
+		props.put("group.id", topicGroupId);
+		props.put("zookeeper.session.timeout.ms", zkSessionTimeoutMs);
+		props.put("zookeeper.sync.time.ms", zkSyncTimeMs);
+		props.put("auto.commit", "true");
+		props.put("auto.commit.interval.ms", autoCommitIntervalMs);
+		props.put("autooffset.reset", "largest");
 
-  private ScheduledThreadPoolExecutor scheduledPool;
+		this.connector = kafka.consumer.Consumer.createJavaConsumerConnector(new ConsumerConfig(props));
 
-  private Map<String, Processor> processorMap;
+		Options options = new Options();
+		options.createIfMissing(true);
+		this.leveldb = factory.open(new File(dbFilePath), options);
+	}
 
-  private DB leveldb;
+	/**
+	 * 1. 从内存中加载 Topic 对应的 Worker 实例 2. 根据 Topic 创建对应的 Processor，并提交 Worker
+	 * 进入线程池
+	 */
+	public void process() {
 
-  @Value("${TOPIC_LIST}")
-  public String topicListStr;
+		// 加载 Topic 对应的 Worker
+		ApplicationContext context = StartUp.getContext();
+		String[] beans = context.getBeanNamesForAnnotation(Worker.class);
+		Map<String, List<String>> beanMap = new HashMap<String, List<String>>();
+		for (String s : beans) {
+			Worker work = context.findAnnotationOnBean(s, Worker.class);
 
-  @Value("${MAX_WORKER_COUNT}")
-  private int maxWorkerCount;
+			if (beanMap.containsKey(work.topic())) {
+				beanMap.get(work.topic()).add(s);
+				continue;
+			}
 
-  @Value("${ZK_CONNECT_HOST}")
-  private String zkConnectHost;
+			beanMap.put(work.topic(), Arrays.asList(s));
+		}
 
-  @Value("${TOPIC_GROUP_ID}")
-  private String topicGroupId;
+		// 启动 Topic 对应的 Worker 线程
+		for (String topic : topicListStr.split(",")) {
 
-  @Value("${ZK_SESSION_TIMEOUT_MS}")
-  private String zkSessionTimeoutMs;
+			if (!beanMap.containsKey(topic)) {
+				continue;
+			}
 
-  @Value("${ZK_SYNC_TIME_MS}")
-  private String zkSyncTimeMs;
+			Log.i("topic: " + topic);
 
-  @Value("${AUTO_COMMIT_INTERVAL_MS}")
-  private String autoCommitIntervalMs;
+			Processor processor = new Processor(topic, connector, maxWorkerCount, beanMap.get(topic), leveldb);
+			pool.submit(processor);
+			processorMap.put(topic, processor);
+		}
 
-  @Value("${LEVEL_DB_DIR}")
-  private String dbFilePath;
+		// 每五秒扫描一次LevelDB，重试消费不成功的message
+		startDaemon();
+	}
 
+	/**
+	 * 1. 启动守护线程，每5秒扫描一次 levelDB 中存储的 message 2. 根据 message 对应的 Topic，从
+	 * processorMap 中找出对应的 Processor，若不存在则创建 3. 调用 Processor 处理 Message
+	 */
+	private void startDaemon() {
+		scheduledPool.scheduleAtFixedRate(new Runnable() {
+			@Override
+			public void run() {
 
-  public Map<String, Object> getStatus() {
-    Map<String, Object> status = new HashMap<>();
-    status.put("pool_size", pool.getPoolSize());
-    status.put("active_count", pool.getActiveCount());
-    status.put("queue_size", pool.getQueue().size());
-    return status;
-  }
+				DBIterator iterator = leveldb.iterator();
+				try {
+					for (iterator.seekToFirst(); iterator.hasNext(); iterator.next()) {
+						byte[] key = iterator.peekNext().getKey();
+						JSONObject message = new JSONObject(asString(iterator.peekNext().getValue()));
+						if (!processorMap.containsKey(message.getString("topic"))) {
+							continue;
+						}
 
-  @PostConstruct
-  public void init() throws IOException {
-    this.pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(100);
-    this.scheduledPool = (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(1);
-    this.processorMap = new HashMap<>();
+						Log.i("message" + message);
+						// 调用 Topic 对应的 Processor 处理 message
+						processorMap.get(message.getString("topic")).distributeMessage(message.getString("value"));
+						leveldb.delete(key);
+					}
 
-    Properties props = new Properties();
-    props.put("zookeeper.connect", zkConnectHost);
-    props.put("group.id", topicGroupId);
-    props.put("zookeeper.session.timeout.ms", zkSessionTimeoutMs);
-    props.put("zookeeper.sync.time.ms", zkSyncTimeMs);
-    props.put("auto.commit", "true");
-    props.put("auto.commit.interval.ms", autoCommitIntervalMs);
-    props.put("autooffset.reset", "largest");
+				} catch (Exception e) {
+					Log.e(e);
+				} finally {
+					try {
+						iterator.close();
+					} catch (IOException e) {
+						Log.e(e);
+					}
+				}
+			}
+		}, 0, 5, TimeUnit.SECONDS);
+	}
 
-    this.connector = kafka.consumer.Consumer.createJavaConsumerConnector(new ConsumerConfig(props));
+	/**
+	 * 返回 Engine 工作状态
+	 */
+	public Map<String, Object> getStatus() {
+		Map<String, Object> status = new HashMap<>();
+		status.put("pool_size", pool.getPoolSize());
+		status.put("active_count", pool.getActiveCount());
+		status.put("queue_size", pool.getQueue().size());
+		return status;
+	}
 
-    Options options = new Options();
-    options.createIfMissing(true);
-    this.leveldb = factory.open(new File(dbFilePath), options);
-  }
+	private ConsumerConnector connector;
 
-  public void process() {
+	private ThreadPoolExecutor pool;
 
-    // 加载 Topic 对应的 Worker
-    ApplicationContext context = StartUp.getContext();
-    String[] beans = context.getBeanNamesForAnnotation(Worker.class);
-    Map<String, List<String>> beanMap = new HashMap<String, List<String>>();
-    for (String s : beans) {
-      Worker work = context.findAnnotationOnBean(s, Worker.class);
+	private ScheduledThreadPoolExecutor scheduledPool;
 
-      if (beanMap.containsKey(work.topic())) {
-        beanMap.get(work.topic()).add(s);
-        continue;
-      }
+	private Map<String, Processor> processorMap;
 
-      beanMap.put(work.topic(), Arrays.asList(s));
-    }
+	private DB leveldb;
 
-    // 启动 Topic 对应的 Worker 线程
-    for (String topic : topicListStr.split(",")) {
+	@Value("${TOPIC_LIST}")
+	public String topicListStr;
 
-      if (!beanMap.containsKey(topic)) {
-        continue;
-      }
-      
-      Log.i("topic: " + topic);
+	@Value("${MAX_WORKER_COUNT}")
+	private int maxWorkerCount;
 
-      Processor processor = new Processor(topic, connector, maxWorkerCount, beanMap.get(topic), leveldb);
-      pool.submit(processor);
-      processorMap.put(topic, processor);
-    }
+	@Value("${ZK_CONNECT_HOST}")
+	private String zkConnectHost;
 
-    // 每五秒扫描一次LevelDB，重试消费不成功的message
-    startDaemon();
-  }
+	@Value("${TOPIC_GROUP_ID}")
+	private String topicGroupId;
 
-  private void startDaemon() {
-    scheduledPool.scheduleAtFixedRate(new Runnable() {
+	@Value("${ZK_SESSION_TIMEOUT_MS}")
+	private String zkSessionTimeoutMs;
 
-      @Override
-      public void run() {
+	@Value("${ZK_SYNC_TIME_MS}")
+	private String zkSyncTimeMs;
 
-        DBIterator iterator = leveldb.iterator();
-        try {
-          for (iterator.seekToFirst(); iterator.hasNext(); iterator.next()) {
-            byte[] key = iterator.peekNext().getKey();
-            JSONObject message = new JSONObject(asString(iterator.peekNext().getValue()));
-            if (!processorMap.containsKey(message.getString("topic"))) {
-              continue;
-            }
-            
-            Log.i("message" + message);
-            processorMap.get(message.getString("topic")).distributeMessage(message.getString("value"));
-            leveldb.delete(key);
-          }
-          
-        } catch (Exception e) {
-          Log.e(e);
-        } finally {
-          try {
-            iterator.close();
-          } catch (IOException e) {
-            Log.e(e);
-          }
-        }
-      }
-    }, 0, 5, TimeUnit.SECONDS);
-  }
+	@Value("${AUTO_COMMIT_INTERVAL_MS}")
+	private String autoCommitIntervalMs;
+
+	@Value("${LEVEL_DB_DIR}")
+	private String dbFilePath;
 
 }
